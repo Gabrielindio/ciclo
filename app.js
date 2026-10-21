@@ -115,20 +115,77 @@
   });
 
   // ---------- Estado ----------
+  // Progresso (done/closing/daily) fica no banco SQLite local quando o app é
+  // servido pelo server.js; aberto direto do arquivo, fica no navegador.
+  // Preferências de tela (tema, filtro) ficam sempre no navegador.
   const KEY = 'cicloRFB:v1';
-  const defaults = () => ({ done: {}, closing: {}, daily: {}, theme: 'auto', hideDone: false });
-  let state = load();
+  const PREFS_KEY = 'cicloRFB:prefs';
+  const API = location.protocol.startsWith('http') ? '/api' : null;
+  let mode = 'local';
+  const emptyProgress = () => ({ done: {}, closing: {}, daily: {} });
+  const defaults = () => Object.assign(emptyProgress(), { theme: 'auto', hideDone: false });
+  let state = Object.assign(defaults(), readLocalProgress(), readPrefs());
 
-  function load() {
-    try {
-      const s = JSON.parse(localStorage.getItem(KEY));
-      if (s && typeof s === 'object') return Object.assign(defaults(), s);
-    } catch (e) { /* armazenamento indisponível */ }
-    return defaults();
+  function readJsonKey(key) {
+    try { const v = JSON.parse(localStorage.getItem(key)); return v && typeof v === 'object' ? v : null; }
+    catch (e) { return null; }
   }
-  function save() {
-    try { localStorage.setItem(KEY, JSON.stringify(state)); }
+  function readLocalProgress() {
+    const s = readJsonKey(KEY);
+    return s ? { done: s.done || {}, closing: s.closing || {}, daily: s.daily || {} } : emptyProgress();
+  }
+  function readPrefs() {
+    const p = readJsonKey(PREFS_KEY) || readJsonKey(KEY) || {};
+    return { theme: p.theme || 'auto', hideDone: !!p.hideDone };
+  }
+  function progressOf(s) { return { done: s.done, closing: s.closing, daily: s.daily }; }
+
+  function savePrefs() {
+    try { localStorage.setItem(PREFS_KEY, JSON.stringify({ theme: state.theme, hideDone: state.hideDone })); }
+    catch (e) { /* preferências são opcionais */ }
+  }
+  function saveLocal() {
+    try { localStorage.setItem(KEY, JSON.stringify(progressOf(state))); }
     catch (e) { toast('Não foi possível salvar no navegador.'); }
+  }
+
+  async function api(method, url, body) {
+    const r = await fetch(API + url, {
+      method,
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.erro || `HTTP ${r.status}`);
+    return data;
+  }
+
+  // Grava uma alteração de progresso: no banco (modo servidor) ou no navegador.
+  function persist(request) {
+    if (mode !== 'server') { saveLocal(); return; }
+    request().catch(err => {
+      console.error(err);
+      toast('⚠ Não foi possível salvar no banco local. O servidor está rodando?');
+    });
+  }
+
+  async function initStorage() {
+    if (!API) return;
+    try {
+      const remote = await api('GET', '/progresso');
+      mode = 'server';
+      const local = readLocalProgress();
+      const remoteEmpty = !Object.keys(remote.done).length && !Object.keys(remote.closing).length;
+      if (remoteEmpty && Object.keys(local.done).length) {
+        Object.assign(state, await api('PUT', '/progresso', local));
+        toast('Progresso do navegador copiado para o banco local');
+      } else {
+        Object.assign(state, remote);
+      }
+    } catch (e) {
+      mode = 'local';
+      console.warn('Banco local indisponível, usando o navegador.', e);
+    }
   }
 
   // ---------- Utilitários ----------
@@ -525,7 +582,13 @@
     const hard = CYCLES.filter(c => (state.closing[c.n] || {}).text).map(c =>
       `<div class="group-title"><span>Ciclo ${pad(c.n)}</span><a href="#/ciclo/${c.n}#fechamento">abrir</a></div><p style="margin:4px 0 0;white-space:pre-wrap">${esc(state.closing[c.n].text)}</p>`).join('');
     return `<div class="stack">
-      <div class="page-head"><div><h1>Ajustes</h1><p class="muted">Seu progresso fica salvo neste navegador.</p></div></div>
+      <div class="page-head"><div><h1>Ajustes</h1></div></div>
+      <section class="card">
+        <h2 style="margin-bottom:8px">Onde o progresso é salvo</h2>
+        ${mode === 'server'
+          ? `<div class="banner"><span>🗄️</span><div><strong>Banco de dados local</strong><br><span class="small">Arquivo <code>data/progresso.db</code> (SQLite) na pasta do projeto.</span></div></div>`
+          : `<p class="muted small" style="margin:0">Somente neste navegador. Para usar o banco de dados local, rode <code>npm start</code> na pasta do projeto e abra <code>http://localhost:3000</code>.</p>`}
+      </section>
       <section class="card">
         <h2 style="margin-bottom:12px">Tema</h2>
         <div class="seg" role="group" aria-label="Tema">
@@ -548,7 +611,7 @@
       </section>
       <section class="card">
         <h2>Zerar progresso</h2>
-        <p class="muted small">Apaga todas as marcações e anotações deste navegador. Faça um backup antes.</p>
+        <p class="muted small">Apaga todas as marcações e anotações ${mode === 'server' ? 'do banco local' : 'deste navegador'}. Faça um backup antes.</p>
         <button class="btn danger" data-reset>Zerar tudo</button>
       </section>
     </div>`;
@@ -619,7 +682,7 @@
     touched.forEach(n => { before[n] = cycleProgress(CYCLES[n - 1]).complete; });
     const now = new Date().toISOString();
     ids.forEach(id => { if (value) state.done[id] = state.done[id] || now; else delete state.done[id]; });
-    save();
+    persist(() => api('POST', '/itens', { ids, concluido: value }));
     touched.forEach(n => { if (!before[n] && cycleProgress(CYCLES[n - 1]).complete) toast(`🎉 Ciclo ${pad(n)} concluído!`); });
   }
 
@@ -627,7 +690,7 @@
     const was = cycleProgress(CYCLES[n - 1]).complete;
     state.closing[n] = state.closing[n] || {};
     state.closing[n][key] = value;
-    save();
+    persist(() => api('PUT', `/fechamento/${n}`, { [key]: value }));
     if (!was && cycleProgress(CYCLES[n - 1]).complete) toast(`🎉 Ciclo ${pad(n)} concluído!`);
   }
 
@@ -635,8 +698,12 @@
     const t = e.target;
     if (t.dataset.toggle) { setDone([t.dataset.toggle], t.checked); render(true); }
     else if (t.dataset.closing) { const [n, k] = t.dataset.closing.split(':'); setClosing(+n, k, t.checked); render(true); }
-    else if (t.dataset.daily) { if (t.checked) state.daily[t.dataset.daily] = true; else delete state.daily[t.dataset.daily]; save(); }
-    else if ('hide' in t.dataset) { state.hideDone = t.checked; save(); render(true); }
+    else if (t.dataset.daily) {
+      const day = t.dataset.daily, feita = t.checked;
+      if (feita) state.daily[day] = true; else delete state.daily[day];
+      persist(() => api('PUT', `/revisao-diaria/${day}`, { feita }));
+    }
+    else if ('hide' in t.dataset) { state.hideDone = t.checked; savePrefs(); render(true); }
     else if ('import' in t.dataset && t.files[0]) importFile(t.files[0]);
   });
 
@@ -653,13 +720,15 @@
       setDone(CYCLES[n - 1].disc[code].list.map(l => l.id), true);
       render(true);
     } else if (b.dataset.themeSet) {
-      state.theme = b.dataset.themeSet; save(); applyTheme(); render(true);
+      state.theme = b.dataset.themeSet; savePrefs(); applyTheme(); render(true);
     } else if ('export' in b.dataset) {
       exportFile();
     } else if ('reset' in b.dataset) {
-      if (confirm('Apagar todo o progresso deste navegador? Isso não pode ser desfeito.')) {
-        const theme = state.theme;
-        state = defaults(); state.theme = theme; save(); toast('Progresso zerado'); render();
+      const where = mode === 'server' ? 'do banco local' : 'deste navegador';
+      if (confirm(`Apagar todo o progresso ${where}? Isso não pode ser desfeito.`)) {
+        Object.assign(state, emptyProgress());
+        persist(() => api('DELETE', '/progresso'));
+        toast('Progresso zerado'); render();
       }
     }
   });
@@ -672,7 +741,7 @@
       state.closing[n] = state.closing[n] || {};
       state.closing[n].text = t.value;
       clearTimeout(saveTextTimer);
-      saveTextTimer = setTimeout(save, 300);
+      saveTextTimer = setTimeout(() => persist(() => api('PUT', `/fechamento/${n}`, { text: state.closing[n].text })), 400);
     } else if (t.id === 'search') {
       searchQuery = t.value;
       $('#searchResults').innerHTML = searchResults(searchQuery);
@@ -680,7 +749,7 @@
   });
 
   function exportFile() {
-    const data = { app: 'ciclo-rfb', version: 1, exportedAt: new Date().toISOString(), state };
+    const data = { app: 'ciclo-rfb', version: 1, exportedAt: new Date().toISOString(), state: progressOf(state) };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -699,8 +768,15 @@
         const s = data && data.state;
         if (!s || typeof s.done !== 'object') throw new Error('formato');
         if (!confirm('Substituir o progresso atual pelo do arquivo?')) return;
-        state = Object.assign(defaults(), s);
-        save(); applyTheme(); toast('Progresso importado'); render();
+        const incoming = { done: s.done, closing: s.closing || {}, daily: s.daily || {} };
+        if (mode === 'server') {
+          api('PUT', '/progresso', incoming)
+            .then(saved => { Object.assign(state, saved); toast('Progresso importado para o banco local'); render(); })
+            .catch(() => toast('⚠ Falha ao importar para o banco local'));
+        } else {
+          Object.assign(state, incoming);
+          saveLocal(); toast('Progresso importado'); render();
+        }
       } catch (err) {
         toast('Arquivo inválido');
       }
@@ -709,8 +785,16 @@
   }
 
   window.addEventListener('hashchange', () => render());
-  window.addEventListener('storage', e => { if (e.key === KEY) { state = load(); render(true); } });
+  window.addEventListener('storage', e => {
+    if (e.key === KEY && mode === 'local') { Object.assign(state, readLocalProgress()); render(true); }
+  });
+  // No modo servidor, ao voltar para a aba recarrega o progresso do banco
+  // (pode ter sido alterado em outra aba ou aparelho).
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || mode !== 'server') return;
+    api('GET', '/progresso').then(p => { Object.assign(state, p); render(true); }).catch(() => {});
+  });
 
   applyTheme();
-  render();
+  initStorage().then(() => render());
 })();

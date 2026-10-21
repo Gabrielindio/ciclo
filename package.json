@@ -1,0 +1,13 @@
+{
+  "name": "ciclo-estudos-receita",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gerenciador do ciclo de estudos para Auditor-Fiscal da RFB, com progresso salvo em SQLite local.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
