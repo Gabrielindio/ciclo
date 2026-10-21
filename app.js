@@ -115,13 +115,21 @@
   });
 
   // ---------- Estado ----------
-  // Progresso (done/closing/daily) fica no banco SQLite local quando o app é
-  // servido pelo server.js; aberto direto do arquivo, fica no navegador.
+  // O progresso (done/closing/daily) é salvo em um destes lugares, nesta ordem:
+  //  1. Supabase, se config.js estiver preenchido (exige login);
+  //  2. banco SQLite local, se o app for servido pelo server.js;
+  //  3. o próprio navegador (localStorage).
   // Preferências de tela (tema, filtro) ficam sempre no navegador.
   const KEY = 'cicloRFB:v1';
   const PREFS_KEY = 'cicloRFB:prefs';
+  const SB_CFG = window.SUPABASE_CONFIG || {};
+  const SB_WANTED = !!(SB_CFG.url && SB_CFG.anonKey);
   const API = location.protocol.startsWith('http') ? '/api' : null;
-  let mode = 'local';
+  const TIPO = { lesson: 'aula', review: 'revisao', extra: 'extra' };
+  const WHERE = { supabase: 'da sua conta', server: 'do banco local', local: 'deste navegador' };
+  let mode = 'local';      // 'supabase' | 'server' | 'local'
+  let backend = null;      // null = navegador
+  let sb = null, user = null;
   const emptyProgress = () => ({ done: {}, closing: {}, daily: {} });
   const defaults = () => Object.assign(emptyProgress(), { theme: 'auto', hideDone: false });
   let state = Object.assign(defaults(), readLocalProgress(), readPrefs());
@@ -139,6 +147,7 @@
     return { theme: p.theme || 'auto', hideDone: !!p.hideDone };
   }
   function progressOf(s) { return { done: s.done, closing: s.closing, daily: s.daily }; }
+  const isEmptyProgress = p => !Object.keys(p.done).length && !Object.keys(p.closing).length && !Object.keys(p.daily).length;
 
   function savePrefs() {
     try { localStorage.setItem(PREFS_KEY, JSON.stringify({ theme: state.theme, hideDone: state.hideDone })); }
@@ -149,6 +158,7 @@
     catch (e) { toast('Não foi possível salvar no navegador.'); }
   }
 
+  // ----- Servidor local (server.js + SQLite) -----
   async function api(method, url, body) {
     const r = await fetch(API + url, {
       method,
@@ -159,31 +169,153 @@
     if (!r.ok) throw new Error(data.erro || `HTTP ${r.status}`);
     return data;
   }
+  const serverBackend = {
+    load: () => api('GET', '/progresso'),
+    items: (ids, value) => api('POST', '/itens', { ids, concluido: value }),
+    closing: n => api('PUT', `/fechamento/${n}`, state.closing[n] || {}),
+    daily: (day, feita) => api('PUT', `/revisao-diaria/${day}`, { feita }),
+    replace: p => api('PUT', '/progresso', p),
+    clear: () => api('DELETE', '/progresso'),
+  };
 
-  // Grava uma alteração de progresso: no banco (modo servidor) ou no navegador.
-  function persist(request) {
-    if (mode !== 'server') { saveLocal(); return; }
-    request().catch(err => {
+  // ----- Supabase -----
+  const TABLES = ['itens_concluidos', 'fechamento_ciclo', 'revisao_diaria'];
+  function sbCheck({ data, error }) { if (error) throw error; return data; }
+  async function sbAll(table, cols) {
+    const rows = [], size = 1000; // o Supabase devolve no máximo 1000 linhas por consulta
+    for (let from = 0; ; from += size) {
+      const data = sbCheck(await sb.from(table).select(cols).range(from, from + size - 1));
+      rows.push(...data);
+      if (data.length < size) return rows;
+    }
+  }
+  async function sbInsert(table, rows) {
+    for (let i = 0; i < rows.length; i += 500) sbCheck(await sb.from(table).insert(rows.slice(i, i + 500)));
+  }
+  function itemRow(id, when) {
+    const L = LESSONS[id];
+    return { user_id: user.id, item_id: id, ciclo: L.cycle, disciplina: L.code, tipo: TIPO[L.kind], concluido_em: when || new Date().toISOString() };
+  }
+  function closingRow(n, c = {}) {
+    return {
+      user_id: user.id, ciclo: +n,
+      revisar_resumos: !!c.rev, questoes_mistas: !!c.mix, assuntos_anotados: !!c.hard,
+      assuntos_dificeis: String(c.text || '').slice(0, 5000), atualizado_em: new Date().toISOString(),
+    };
+  }
+  const supabaseBackend = {
+    async load() {
+      const [items, closings, days] = await Promise.all([
+        sbAll('itens_concluidos', 'item_id, concluido_em'),
+        sbAll('fechamento_ciclo', 'ciclo, revisar_resumos, questoes_mistas, assuntos_anotados, assuntos_dificeis'),
+        sbAll('revisao_diaria', 'data'),
+      ]);
+      const p = emptyProgress();
+      items.forEach(r => { p.done[r.item_id] = r.concluido_em; });
+      closings.forEach(r => { p.closing[r.ciclo] = { rev: r.revisar_resumos, mix: r.questoes_mistas, hard: r.assuntos_anotados, text: r.assuntos_dificeis }; });
+      days.forEach(r => { p.daily[r.data] = true; });
+      return p;
+    },
+    async items(ids, value) {
+      if (value) {
+        const rows = ids.map(id => itemRow(id, state.done[id]));
+        sbCheck(await sb.from('itens_concluidos').upsert(rows, { onConflict: 'user_id,item_id', ignoreDuplicates: true }));
+      } else {
+        sbCheck(await sb.from('itens_concluidos').delete().eq('user_id', user.id).in('item_id', ids));
+      }
+    },
+    async closing(n) {
+      sbCheck(await sb.from('fechamento_ciclo').upsert(closingRow(n, state.closing[n]), { onConflict: 'user_id,ciclo' }));
+    },
+    async daily(day, feita) {
+      if (feita) sbCheck(await sb.from('revisao_diaria').upsert({ user_id: user.id, data: day }, { onConflict: 'user_id,data', ignoreDuplicates: true }));
+      else sbCheck(await sb.from('revisao_diaria').delete().eq('user_id', user.id).eq('data', day));
+    },
+    async clear() {
+      for (const t of TABLES) sbCheck(await sb.from(t).delete().eq('user_id', user.id));
+    },
+    async replace(p) {
+      await supabaseBackend.clear();
+      const ids = Object.keys(p.done).filter(id => LESSONS[id] && !Number.isNaN(Date.parse(p.done[id])));
+      await sbInsert('itens_concluidos', ids.map(id => itemRow(id, p.done[id])));
+      await sbInsert('fechamento_ciclo', Object.entries(p.closing || {})
+        .filter(([n]) => +n >= 1 && +n <= 40).map(([n, c]) => closingRow(n, c)));
+      await sbInsert('revisao_diaria', Object.keys(p.daily || {})
+        .filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)).map(d => ({ user_id: user.id, data: d })));
+      return supabaseBackend.load();
+    },
+  };
+
+  // Grava uma alteração de progresso no destino em uso.
+  function store(op, ...args) {
+    if (!backend) { saveLocal(); return; }
+    backend[op](...args).catch(err => {
       console.error(err);
-      toast('⚠ Não foi possível salvar no banco local. O servidor está rodando?');
+      toast(mode === 'supabase'
+        ? '⚠ Não foi possível salvar no Supabase. Verifique a conexão.'
+        : '⚠ Não foi possível salvar no banco local. O servidor está rodando?');
     });
   }
 
+  // Carrega do destino remoto. Se ele estiver vazio e houver progresso salvo
+  // no navegador, envia esse progresso uma única vez (migração).
+  async function loadRemote() {
+    const remote = await backend.load();
+    const local = readLocalProgress();
+    if (isEmptyProgress(remote) && Object.keys(local.done).length) {
+      Object.assign(state, await backend.replace(local));
+      try { localStorage.setItem(`${KEY}:migrado`, JSON.stringify(local)); localStorage.removeItem(KEY); } catch (e) { /* ok */ }
+      toast(mode === 'supabase' ? 'Progresso do navegador enviado para sua conta' : 'Progresso do navegador copiado para o banco local');
+    } else {
+      Object.assign(state, remote);
+    }
+  }
+
+  // Links de confirmação de e-mail voltam com tokens no "#", que é usado pelas rotas.
+  function cleanAuthHash() {
+    const h = location.hash;
+    if (!/access_token=|error=|type=signup|type=recovery/.test(h)) return;
+    const err = new URLSearchParams(h.replace(/^#/, '')).get('error_description');
+    if (err) setTimeout(() => toast(`⚠ ${err.replace(/\+/g, ' ')}`), 300);
+    history.replaceState(null, '', location.pathname + location.search + '#/');
+  }
+
+  async function useSupabaseUser(next) {
+    user = next;
+    if (user) {
+      backend = supabaseBackend;
+      try { await loadRemote(); }
+      catch (err) { console.error(err); toast('⚠ Não foi possível carregar seu progresso do Supabase'); }
+    } else {
+      backend = null;
+      Object.assign(state, emptyProgress());
+    }
+  }
+
   async function initStorage() {
+    if (SB_WANTED) {
+      if (!window.supabase) { toast('⚠ Não foi possível carregar o Supabase. Usando só o navegador.'); return; }
+      mode = 'supabase';
+      sb = window.supabase.createClient(SB_CFG.url, SB_CFG.anonKey);
+      const { data } = await sb.auth.getSession();
+      cleanAuthHash();
+      await useSupabaseUser(data.session ? data.session.user : null);
+      sb.auth.onAuthStateChange((event, session) => {
+        const next = session ? session.user : null;
+        if ((next && next.id) === (user && user.id)) return;
+        // fora do callback, como recomenda a documentação do supabase-js
+        setTimeout(() => useSupabaseUser(next).then(() => render()), 0);
+      });
+      return;
+    }
     if (!API) return;
     try {
-      const remote = await api('GET', '/progresso');
       mode = 'server';
-      const local = readLocalProgress();
-      const remoteEmpty = !Object.keys(remote.done).length && !Object.keys(remote.closing).length;
-      if (remoteEmpty && Object.keys(local.done).length) {
-        Object.assign(state, await api('PUT', '/progresso', local));
-        toast('Progresso do navegador copiado para o banco local');
-      } else {
-        Object.assign(state, remote);
-      }
+      backend = serverBackend;
+      await loadRemote();
     } catch (e) {
       mode = 'local';
+      backend = null;
       console.warn('Banco local indisponível, usando o navegador.', e);
     }
   }
@@ -585,9 +717,7 @@
       <div class="page-head"><div><h1>Ajustes</h1></div></div>
       <section class="card">
         <h2 style="margin-bottom:8px">Onde o progresso é salvo</h2>
-        ${mode === 'server'
-          ? `<div class="banner"><span>🗄️</span><div><strong>Banco de dados local</strong><br><span class="small">Arquivo <code>data/progresso.db</code> (SQLite) na pasta do projeto.</span></div></div>`
-          : `<p class="muted small" style="margin:0">Somente neste navegador. Para usar o banco de dados local, rode <code>npm start</code> na pasta do projeto e abra <code>http://localhost:3000</code>.</p>`}
+        ${storageCard()}
       </section>
       <section class="card">
         <h2 style="margin-bottom:12px">Tema</h2>
@@ -611,10 +741,48 @@
       </section>
       <section class="card">
         <h2>Zerar progresso</h2>
-        <p class="muted small">Apaga todas as marcações e anotações ${mode === 'server' ? 'do banco local' : 'deste navegador'}. Faça um backup antes.</p>
+        <p class="muted small">Apaga todas as marcações e anotações ${WHERE[mode]}. Faça um backup antes.</p>
         <button class="btn danger" data-reset>Zerar tudo</button>
       </section>
     </div>`;
+  }
+
+  function storageCard() {
+    if (mode === 'supabase') {
+      return `<div class="banner"><span>☁️</span><div style="flex:1;min-width:0"><strong>Sua conta no Supabase</strong><br>
+        <span class="small">Conectado como ${esc(user ? user.email : '')}. O progresso sincroniza entre seus aparelhos.</span></div>
+        <button class="btn sm" data-logout>Sair</button></div>`;
+    }
+    if (mode === 'server') {
+      return `<div class="banner"><span>🗄️</span><div><strong>Banco de dados local</strong><br><span class="small">Arquivo <code>data/progresso.db</code> (SQLite) na pasta do projeto.</span></div></div>`;
+    }
+    return `<p class="muted small" style="margin:0">Somente neste navegador. Para sincronizar entre aparelhos, preencha o <code>config.js</code> com os dados do Supabase.</p>`;
+  }
+
+  function viewLogin() {
+    return `<div class="stack" style="max-width:420px;margin:16px auto 0">
+      <div><h1>Entrar</h1><p class="muted" style="margin:4px 0 0">Seu progresso fica salvo na sua conta e sincroniza entre celular e computador.</p></div>
+      <form class="card stack" id="loginForm" novalidate>
+        <label class="field"><span>E-mail</span><input class="search" type="email" name="email" autocomplete="email" required></label>
+        <label class="field"><span>Senha</span><input class="search" type="password" name="password" autocomplete="current-password" minlength="6" required></label>
+        <div class="btn-row">
+          <button class="btn primary" type="submit" data-auth="in">Entrar</button>
+          <button class="btn" type="submit" data-auth="up">Criar conta</button>
+        </div>
+        <p class="muted small" id="loginMsg" role="status" style="margin:0"></p>
+      </form>
+    </div>`;
+  }
+
+  function authMessage(err) {
+    const m = String((err && err.message) || err);
+    if (/invalid login credentials/i.test(m)) return 'E-mail ou senha incorretos.';
+    if (/email not confirmed/i.test(m)) return 'Confirme seu e-mail pelo link que enviamos antes de entrar.';
+    if (/already registered|already been registered/i.test(m)) return 'Este e-mail já tem conta. Use “Entrar”.';
+    if (/signups? not allowed|signup is disabled/i.test(m)) return 'Novos cadastros estão desativados neste projeto.';
+    if (/password should be at least/i.test(m)) return 'A senha precisa ter pelo menos 6 caracteres.';
+    if (/rate limit/i.test(m)) return 'Muitas tentativas. Aguarde alguns minutos e tente de novo.';
+    return m;
   }
 
   function viewNotFound() {
@@ -636,7 +804,8 @@
     const { parts, anchor } = route();
     const page = parts[0] || 'painel';
     let html, nav = page;
-    switch (page) {
+    if (mode === 'supabase' && !user) { html = viewLogin(); nav = ''; }
+    else switch (page) {
       case 'painel': html = viewPainel(); break;
       case 'ciclo': html = viewCiclo(parts[1] ? +parts[1] : currentCycle().n); break;
       case 'disciplinas': html = viewDisciplinas(searchQuery); break;
@@ -682,7 +851,7 @@
     touched.forEach(n => { before[n] = cycleProgress(CYCLES[n - 1]).complete; });
     const now = new Date().toISOString();
     ids.forEach(id => { if (value) state.done[id] = state.done[id] || now; else delete state.done[id]; });
-    persist(() => api('POST', '/itens', { ids, concluido: value }));
+    store('items', ids, value);
     touched.forEach(n => { if (!before[n] && cycleProgress(CYCLES[n - 1]).complete) toast(`🎉 Ciclo ${pad(n)} concluído!`); });
   }
 
@@ -690,7 +859,7 @@
     const was = cycleProgress(CYCLES[n - 1]).complete;
     state.closing[n] = state.closing[n] || {};
     state.closing[n][key] = value;
-    persist(() => api('PUT', `/fechamento/${n}`, { [key]: value }));
+    store('closing', n);
     if (!was && cycleProgress(CYCLES[n - 1]).complete) toast(`🎉 Ciclo ${pad(n)} concluído!`);
   }
 
@@ -701,7 +870,7 @@
     else if (t.dataset.daily) {
       const day = t.dataset.daily, feita = t.checked;
       if (feita) state.daily[day] = true; else delete state.daily[day];
-      persist(() => api('PUT', `/revisao-diaria/${day}`, { feita }));
+      store('daily', day, feita);
     }
     else if ('hide' in t.dataset) { state.hideDone = t.checked; savePrefs(); render(true); }
     else if ('import' in t.dataset && t.files[0]) importFile(t.files[0]);
@@ -721,15 +890,44 @@
       render(true);
     } else if (b.dataset.themeSet) {
       state.theme = b.dataset.themeSet; savePrefs(); applyTheme(); render(true);
+    } else if ('logout' in b.dataset) {
+      sb.auth.signOut().then(() => { location.hash = '#/'; });
     } else if ('export' in b.dataset) {
       exportFile();
     } else if ('reset' in b.dataset) {
-      const where = mode === 'server' ? 'do banco local' : 'deste navegador';
+      const where = WHERE[mode];
       if (confirm(`Apagar todo o progresso ${where}? Isso não pode ser desfeito.`)) {
         Object.assign(state, emptyProgress());
-        persist(() => api('DELETE', '/progresso'));
+        store('clear');
         toast('Progresso zerado'); render();
       }
+    }
+  });
+
+  document.addEventListener('submit', async e => {
+    if (e.target.id !== 'loginForm') return;
+    e.preventDefault();
+    const f = e.target;
+    const signUp = e.submitter && e.submitter.dataset.auth === 'up';
+    const email = f.email.value.trim(), password = f.password.value;
+    const msg = $('#loginMsg');
+    if (!email || password.length < 6) { msg.textContent = 'Informe o e-mail e uma senha de pelo menos 6 caracteres.'; return; }
+    f.querySelectorAll('button').forEach(b => { b.disabled = true; });
+    msg.textContent = 'Aguarde…';
+    try {
+      if (signUp) {
+        const { data, error } = await sb.auth.signUp({ email, password, options: { emailRedirectTo: location.origin + location.pathname } });
+        if (error) throw error;
+        if (!data.session) msg.textContent = 'Conta criada! Abra o link de confirmação enviado ao seu e-mail e depois entre aqui.';
+      } else {
+        const { error } = await sb.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        msg.textContent = 'Carregando seu progresso…';
+      }
+    } catch (err) {
+      msg.textContent = authMessage(err);
+    } finally {
+      f.querySelectorAll('button').forEach(b => { b.disabled = false; });
     }
   });
 
@@ -741,7 +939,7 @@
       state.closing[n] = state.closing[n] || {};
       state.closing[n].text = t.value;
       clearTimeout(saveTextTimer);
-      saveTextTimer = setTimeout(() => persist(() => api('PUT', `/fechamento/${n}`, { text: state.closing[n].text })), 400);
+      saveTextTimer = setTimeout(() => store('closing', n), 500);
     } else if (t.id === 'search') {
       searchQuery = t.value;
       $('#searchResults').innerHTML = searchResults(searchQuery);
@@ -769,10 +967,10 @@
         if (!s || typeof s.done !== 'object') throw new Error('formato');
         if (!confirm('Substituir o progresso atual pelo do arquivo?')) return;
         const incoming = { done: s.done, closing: s.closing || {}, daily: s.daily || {} };
-        if (mode === 'server') {
-          api('PUT', '/progresso', incoming)
-            .then(saved => { Object.assign(state, saved); toast('Progresso importado para o banco local'); render(); })
-            .catch(() => toast('⚠ Falha ao importar para o banco local'));
+        if (backend) {
+          backend.replace(incoming)
+            .then(saved => { Object.assign(state, saved); toast('Progresso importado'); render(); })
+            .catch(err => { console.error(err); toast('⚠ Falha ao importar o progresso'); });
         } else {
           Object.assign(state, incoming);
           saveLocal(); toast('Progresso importado'); render();
@@ -791,8 +989,8 @@
   // No modo servidor, ao voltar para a aba recarrega o progresso do banco
   // (pode ter sido alterado em outra aba ou aparelho).
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState !== 'visible' || mode !== 'server') return;
-    api('GET', '/progresso').then(p => { Object.assign(state, p); render(true); }).catch(() => {});
+    if (document.visibilityState !== 'visible' || !backend) return;
+    backend.load().then(p => { Object.assign(state, p); render(true); }).catch(() => {});
   });
 
   applyTheme();

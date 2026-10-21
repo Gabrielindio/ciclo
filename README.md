@@ -2,7 +2,21 @@
 
 Gerenciador dos 40 ciclos de estudo (2.162 aulas), responsivo para celular.
 
-## Como rodar
+## Onde o progresso é salvo
+
+1. **Supabase**, se o `config.js` estiver preenchido. Exige login e sincroniza entre aparelhos; funciona no GitHub Pages.
+2. **SQLite local** (`data/progresso.db`), se o app for aberto pelo `server.js`.
+3. **Navegador**, nos outros casos.
+
+### Configurar o Supabase
+
+1. No painel do Supabase, abra **SQL Editor**, cole o conteúdo de [`supabase/schema.sql`](supabase/schema.sql) e clique em **Run**.
+2. Em **Project Settings → API**, copie a **Project URL** e a chave **anon / publishable** para o `config.js`. Nunca use a `service_role`.
+3. Em **Authentication → URL Configuration**, coloque o endereço do site publicado em **Site URL** e em **Redirect URLs**.
+4. Abra o site, clique em **Criar conta** e confirme o e-mail.
+5. Recomendado: em **Authentication → Sign In / Providers**, desative **Allow new users to sign up**.
+
+## Como rodar localmente
 
 Requer Node.js 22.13 ou mais recente. Não há dependências para instalar.
 

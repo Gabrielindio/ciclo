@@ -344,3 +344,8 @@ mark { background: color-mix(in srgb, var(--a-con) 35%, transparent); color: inh
 .seg button { border: 0; background: var(--surface); padding: 8px 14px; cursor: pointer; }
 .seg button + button { border-left: 1px solid var(--border); }
 .seg button.on { background: var(--primary); color: var(--primary-contrast); }
+
+/* ---------- Login ---------- */
+.field { display: grid; gap: 6px; font-size: .9rem; font-weight: 500; }
+.field .search { font-weight: 400; }
+.banner code, .muted code { font-size: .85em; }
